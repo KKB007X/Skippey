@@ -1,116 +1,59 @@
-import asyncio
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 
+from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 
 from graphiti_core import Graphiti
+from graphiti_core.cross_encoder.bge_reranker_client import BGERerankerClient
 from graphiti_core.embedder.client import EmbedderClient
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.nodes import EpisodeType
-from graphiti_core.cross_encoder.bge_reranker_client import BGERerankerClient
 
-import time
-# ============================================================
-# Local BGE embedding model
-# ============================================================
+load_dotenv()
+
 
 class BGEEmbedder(EmbedderClient):
+    """Local BGE-large embedder used by Graphiti."""
 
-    def __init__(self):
-        print("Loading BGE...")
-        self.model = SentenceTransformer("BAAI/bge-large-en-v1.5")
-        print("BGE loaded!")
+    def __init__(self, model_name: str = "BAAI/bge-large-en-v1.5"):
+        print(f"Loading embedding model: {model_name}")
+        self.model = SentenceTransformer(model_name)
+        print("Embedding model loaded.")
 
     async def create(self, input_data):
-        """
-        Create ONE embedding.
-
-        Graphiti may call this with either:
-            "some text"
-        or:
-            ["some text"]
-
-        Graphiti expects this method to return:
-            list[float]
-        """
-
         if isinstance(input_data, list):
             if len(input_data) != 1:
-                raise ValueError(
-                    f"BGEEmbedder.create() expected one input, "
-                    f"got {len(input_data)}"
-                )
+                raise ValueError(f"Expected one input, got {len(input_data)}")
             input_data = input_data[0]
 
-        embedding = self.model.encode(
-            input_data,
-            convert_to_numpy=True,
-        )
-
-        return [float(x) for x in embedding]
+        embedding = self.model.encode(input_data, convert_to_numpy=True)
+        return [float(value) for value in embedding]
 
     async def create_batch(self, input_data_list):
-        """
-        Create embeddings for multiple texts.
-
-        Returns:
-            list[list[float]]
-        """
-
-        embeddings = self.model.encode(
-            input_data_list,
-            convert_to_numpy=True,
-        )
-
-        return [
-            [float(x) for x in embedding]
-            for embedding in embeddings
-        ]
+        embeddings = self.model.encode(input_data_list, convert_to_numpy=True)
+        return [[float(value) for value in embedding] for embedding in embeddings]
 
 
-# ============================================================
-# Neo4j configuration
-# ============================================================
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "skippey123"
+if not NEO4J_PASSWORD:
+    raise RuntimeError("NEO4J_PASSWORD is not set")
 
-
-# ============================================================
-# Cross encoder / reranker
-# ============================================================
-
-cross_encoder = BGERerankerClient()
-
-
-# ============================================================
-# Local Ollama LLM
-# ============================================================
 
 llm_config = LLMConfig(
-    api_key="ollama",
-    model="qwen3:4b-instruct",
-    small_model="qwen3:4b-instruct",
-    base_url="http://localhost:11434/v1",
+    api_key=os.getenv("GRAPHITI_LLM_API_KEY", "ollama"),
+    model=os.getenv("GRAPHITI_LLM_MODEL", "qwen3:4b-instruct"),
+    small_model=os.getenv("GRAPHITI_LLM_SMALL_MODEL", "qwen3:4b-instruct"),
+    base_url=os.getenv("GRAPHITI_LLM_BASE_URL", "http://localhost:11434/v1"),
 )
 
-llm_client = OpenAIGenericClient(
-    config=llm_config
-)
-
-
-# ============================================================
-# Embedding model
-# ============================================================
-
+llm_client = OpenAIGenericClient(config=llm_config)
 embedder = BGEEmbedder()
-
-
-# ============================================================
-# Graphiti
-# ============================================================
+cross_encoder = BGERerankerClient()
 
 graphiti = Graphiti(
     NEO4J_URI,
@@ -121,80 +64,65 @@ graphiti = Graphiti(
     cross_encoder=cross_encoder,
 )
 
+_initialized = False
 
-# ============================================================
-# Test
-# ============================================================
 
-async def main():
+async def initialize():
+    """Initialize Graphiti indices. Safe to call more than once."""
+    global _initialized
+    if not _initialized:
+        await graphiti.build_indices_and_constraints()
+        _initialized = True
 
-    # --------------------------------------------------------
-    # Verify our embedder
-    # --------------------------------------------------------
 
-    print("\nTesting embedder...")
+async def recall(query: str, limit: int = 10) -> list[str]:
+    """Retrieve multiple relevant facts for one natural-language query."""
+    await initialize()
 
-    test = await embedder.create("test")
+    results = await graphiti.search(query=query)
+    facts = []
 
-    print("TYPE:", type(test))
-    print("LEN:", len(test))
-    print("FIRST:", type(test[0]), test[0])
-    print("NESTED:", isinstance(test[0], (list, tuple)))
+    for result in results[:limit]:
+        fact = getattr(result, "fact", None)
+        if fact:
+            facts.append(fact)
 
-    # This is the important Graphiti case:
-    test_list = await embedder.create(["test"])
+    return facts
 
-    print("\nTesting Graphiti-style single-item input...")
-    print("TYPE:", type(test_list))
-    print("LEN:", len(test_list))
-    print("FIRST:", type(test_list[0]), test_list[0])
-    print("NESTED:", isinstance(test_list[0], (list, tuple)))
 
-    # --------------------------------------------------------
-    # Build Graphiti indices
-    # --------------------------------------------------------
+async def remember(message: str, *, group_id: str = "skippey"):
+    """Store a conversation message as a Graphiti episode."""
+    await initialize()
 
-    print("\nBuilding Neo4j indices...")
-
-    await graphiti.build_indices_and_constraints()
-
-    print("Graphiti initialized!")
-
-    # --------------------------------------------------------
-    # Add test memory
-    # --------------------------------------------------------
-    # print("Adding memory...")
-    start = time.perf_counter()
-
-    await graphiti.add_episode(
-        name=f"skippey_memory_test_{datetime.now().isoformat()}",
-        episode_body="Kamalesh said 'Pizza is my fav food'",
-        source=EpisodeType.text,
+    return await graphiti.add_episode(
+        name=f"conversation_{datetime.now(timezone.utc).isoformat()}",
+        episode_body=message,
+        source=EpisodeType.message,
         source_description="Skippey conversation",
-        reference_time=datetime.now(),
+        reference_time=datetime.now(timezone.utc),
+        group_id=group_id,
     )
-    # print("\nSearching memory...")
 
-    # results = await graphiti.search(
-    #     query="What is my favorite programming language?"
-    # )
 
-    # for result in results:
-    #     print("FACT:", result.fact)
-    #     print("VALID AT:", result.valid_at)
-    #     print("INVALID AT:", result.invalid_at)
-    #     print("---")
+async def process_message(message: str, *, group_id: str = "skippey") -> list[str]:
+    """Recall relevant long-term memory, then store the current message."""
+    memories = await recall(message)
+    await remember(message, group_id=group_id)
+    return memories
 
-    print(f"Memory retrived in {time.perf_counter() - start:.2f}s")
 
-        # --------------------------------------------------------
-        # Close
-        # --------------------------------------------------------
-
+async def close():
     await graphiti.close()
-
-    print("Done.")
-
+    
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import asyncio
+
+    async def demo():
+        memories = await process_message("Kamalesh said that pizza is his favorite food.")
+        print("Recalled memories:")
+        for memory in memories:
+            print(f"- {memory}")
+        await close()
+
+    asyncio.run(demo())
