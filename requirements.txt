@@ -1,0 +1,4 @@
+graphiti-core
+sentence-transformers
+python-dotenv
+requests
