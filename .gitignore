@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+*.log
+.vscode/
+.idea/
+Nvidia_API.txt
