@@ -1,348 +1,456 @@
 # Skippey — Project History
 
-> This is the engineering history of Skippey, not just a description of the final architecture. It records major approaches we tried, why they were changed, problems encountered, and the design principles that survived the experiments.
+> This document records the engineering evolution of Skippey: what the system originally was, why the architecture changed, the problems that drove each change, and the direction of the project.
 >
-> Details that were not measured or preserved exactly are explicitly described as design observations rather than numerical results.
+> Skippey is more than a memory backend. It is a personal AI assistant/chatbot whose memory system has progressively become a major part of the architecture. The long-term goal is to make the assistant behave as much like a persistent, evolving personal assistant as practical, with memory, perception, web access, and other tools added over time.
 
 ---
 
-# 1. The original idea
+# 1. Original Skippey — just a chatbot
 
-Skippey began as a personal AI assistant project whose main challenge was not simply generating responses, but **remembering useful information across conversations**.
+The earliest version of Skippey was much simpler than the current system.
 
-The initial requirements gradually became:
-
-- persistent memory across program restarts;
-- semantic retrieval rather than exact keyword matching;
-- memory reinforcement through later use;
-- importance and recency as factors in persistence;
-- a distinction between short-lived context and durable knowledge;
-- eventually, relationships between people, projects, tools, preferences, and other entities;
-- local LLM inference so core functionality would not depend on the internet;
-- a portable runtime that could eventually be moved to a more powerful GPU laptop.
-
-This caused the memory system to evolve from a small database helper into a separate subsystem of Skippey.
-
----
-
-# 2. Generation 1 — NVIDIA API + PostgreSQL/pgvector
-
-The first practical implementation used a hosted LLM through the **NVIDIA API**. The model used in the early experiments was:
+It was essentially:
 
 ```text
-meta/llama-3.1-8b-instruct
+User
+  ↓
+Skippey
+  ↓
+NVIDIA API
+  ↓
+LLM response
 ```
 
-For persistent memory, the first database design used **PostgreSQL with pgvector**.
+At this stage there was:
 
-The basic idea was straightforward:
+- no persistent memory;
+- no memory database;
+- no memory retrieval;
+- no memory-management tools;
+- no knowledge graph;
+- no local model.
+
+The goal was initially just to get a functional chatbot running.
+
+The first major limitation was obvious: the assistant could respond to a conversation, but it did not retain useful information between interactions.
+
+This led to the first real architectural expansion: giving the chatbot a persistent memory system.
+
+---
+
+# 2. Generation 1 — PostgreSQL + pgvector
+
+The next stage introduced PostgreSQL and pgvector, along with an embedding model downloaded through Hugging Face/Sentence Transformers.
+
+The basic architecture became:
 
 ```text
-Conversation
-    ↓
-LLM
-    ↓
-Memory text
-    ↓
+User message
+     ↓
+Main LLM
+     ↓
+Memory operations
+     ↓
 Embedding
-    ↓
+     ↓
 PostgreSQL + pgvector
 ```
 
-## 2.1 Initial memory table
+The memory database contained information such as:
 
-The early database contained a `memories` table with fields including:
+- memory text;
+- embeddings;
+- importance;
+- creation time;
+- last access time;
+- access/reinforcement information.
 
-- `id`
-- `memory`
-- `embedding`
-- `importance`
-- `created_at`
-- `last_accessed`
-- `access_count`
-
-The embedding model was initially:
+The initial embedding model was:
 
 ```text
 all-MiniLM-L6-v2
 ```
 
-which produced 384-dimensional embeddings.
+with 384-dimensional embeddings.
 
-An HNSW index using cosine distance was created for vector retrieval.
+An HNSW vector index using cosine similarity was used for semantic retrieval.
 
-## 2.2 Initial memory API
+## 2.1 Memory tools
 
-The early memory layer was deliberately simple. It exposed operations along the lines of:
+The main model was given tools for managing its own memory. The early interface included operations such as:
 
 ```text
 remember()
 recall()
+update()/modify()
 forget()
-modify()
 ```
 
-### `remember()`
+The intention was for the LLM to decide when it needed to store, retrieve, change, or remove information.
 
-Stored a memory and its embedding.
-
-### `recall()`
-
-Embedded a query and searched the vector index for semantically similar memories.
-
-### `forget()`
-
-Removed an unwanted memory.
-
-### `modify()`
-
-Allowed an existing memory to be updated rather than creating another independent record.
-
-This established an important principle that remained throughout the project: **memory should be treated as data with a lifecycle, not merely as a chat transcript.**
-
-## 2.3 Memory decay and reinforcement
-
-One of the early design discussions was how memories should disappear.
-
-A fixed TTL was considered too simplistic. Instead, the intended persistence model was based on a combination of:
-
-- importance;
-- recency;
-- how often a memory was recalled or used.
-
-The conceptual model became:
+Conceptually:
 
 ```text
-important + frequently used
-        → durable
-
-unimportant + never used
-        → candidate for decay
+User
+ ↓
+Main LLM
+ ├── remember
+ ├── recall
+ ├── update / modify
+ └── forget
+       ↓
+ PostgreSQL + pgvector
 ```
 
-This idea later became the foundation for temporary/long-term memory promotion.
+This was the first version where Skippey could actually retain information between separate calls.
 
-## 2.4 Problems with the first generation
+---
 
-Vector search solved semantic similarity, but the representation was fundamentally flat.
+# 3. The tool-calling reliability problem
 
-A record such as:
+The PostgreSQL system worked technically, but a new problem appeared: **the model had to reason correctly about when and how to use the memory tools.**
+
+Small models were attractive because they were faster and cheaper, but their reasoning and tool-use reliability were not good enough for consistently managing memory.
+
+Typical problems included:
+
+- inconsistent decisions about when to store a memory;
+- incorrect tool selection;
+- unreliable update/forget decisions;
+- failure to retrieve information when it was needed;
+- unnecessary memory operations;
+- inconsistent behavior between otherwise similar messages.
+
+Larger models were better at reasoning and tool use, but introduced another problem:
 
 ```text
-"Chris uses Python for coding assessments."
+better reasoning
+      ↕
+slower + more expensive inference
 ```
 
-was a useful searchable sentence, but the database did not naturally know that:
+This created an architectural bottleneck rather than simply a model-selection problem.
+
+The important realization was:
+
+> The main conversational model should not necessarily be responsible for every memory-management decision.
+
+---
+
+# 4. Separate memory-management pipeline
+
+To solve the tool-use reliability problem, the architecture was redesigned so that memory management became a **separate pipeline**.
+
+Instead of giving the main chatbot complete freedom to call memory tools, every user message was passed through a dedicated memory-management system first.
+
+The architecture became:
 
 ```text
-Chris ──PREFERS_FOR──► Python
-                         │
+                       User message
+                            │
+                            ▼
+                 ┌─────────────────────┐
+                 │ Memory Manager LLM  │
+                 │                     │
+                 │ Decide what memory  │
+                 │ operations are      │
+                 │ required            │
+                 └──────────┬──────────┘
+                            │
+                 ┌──────────┴──────────┐
+                 ▼                     ▼
+            Operations              Retrieved data
+                 │                     │
+                 └──────────┬──────────┘
+                            ▼
+                    Main chatbot LLM
+                            │
+                            ▼
+                         Response
+```
+
+The memory manager received each message and decided which operations should happen, such as:
+
+```text
+remember
+update
+forget
+recall
+```
+
+The results of those operations, including retrieved memories, were then passed to the main model so that the main model could produce the final response.
+
+This was an important architectural separation:
+
+```text
+Memory reasoning
+        ≠
+Conversation reasoning
+```
+
+The main model could focus on producing a good answer while a dedicated component handled persistent memory.
+
+---
+
+# 5. Why the separate manager still wasn't enough
+
+The separate memory-management pipeline improved the architecture conceptually, but it still depended heavily on the reasoning quality of the model responsible for memory decisions.
+
+It remained inconsistent in cases where the model had to determine:
+
+- what is actually worth remembering;
+- whether a fact already exists;
+- whether something should be updated or forgotten;
+- what information should be recalled;
+- how to phrase an effective retrieval query.
+
+This led to an important shift in thinking:
+
+> The problem was not only how to search memories. The representation of memory itself needed to become richer.
+
+That led to the investigation of **knowledge graphs**.
+
+---
+
+# 6. Generation 2 — Neo4j + Graphiti
+
+The memory backend was moved from PostgreSQL/pgvector to **Neo4j + Graphiti**.
+
+The motivation was to represent memory as a connected knowledge structure rather than a collection of independent vector records.
+
+Graphiti provided:
+
+- episode ingestion;
+- entity extraction;
+- relationship extraction;
+- temporal information;
+- semantic retrieval;
+- embeddings;
+- reranking;
+- Neo4j graph persistence.
+
+The architecture became:
+
+```text
+User message
+     ↓
+Memory manager
+     ↓
+Graphiti
+     ↓
+Entities + relationships + facts
+     ↓
+Neo4j
+```
+
+A fact such as:
+
+```text
+Chris uses Python for coding assessments.
+```
+
+could now conceptually participate in a graph such as:
+
+```text
+Chris ── prefers/uses ──► Python
+                              │
+                              ▼
                     coding assessments
 ```
 
-As Skippey evolved, entity relationships became increasingly important.
-
-There were also practical issues around the LLM's reliability in deciding **what should actually be remembered**. Simply asking an LLM to remember an entire conversation risked storing too much irrelevant context.
-
-This led to the next major idea: memory extraction should be separated from raw conversation storage.
+This was a better fit for a personal assistant because people, projects, tools, preferences, models, and other concepts naturally form relationships.
 
 ---
 
-# 3. Moving toward a memory manager
+# 7. Local LLM — Ollama + Qwen3
 
-Instead of treating every message as a memory, the system began experimenting with an LLM-driven memory manager.
+The project then moved toward fully local inference.
 
-The manager's job was conceptually:
+The hosted NVIDIA API was replaced in the memory pipeline with Ollama and Qwen3.
 
-```text
-Current message
-      ↓
-Memory manager
-      ├── memories worth storing
-      └── information that needs to be recalled
-```
-
-This eventually became the `remember[]` / `recall[]` design.
-
-## 3.1 Breaking messages into memories
-
-A single user message can contain multiple independent facts.
-
-For example:
-
-```text
-I've been working on Skippey.
-I'm using Neo4j for its memory system.
-I prefer Python for coding OAs.
-I use C++ for robotics projects.
-```
-
-should not necessarily become one giant memory.
-
-The manager instead extracts self-contained units such as:
-
-```text
-- Chris is working on Skippey.
-- Skippey's memory system uses Neo4j.
-- Chris prefers Python for coding assessments.
-- Chris uses C++ for robotics projects.
-```
-
-This was important because individual facts can then be independently retrieved, connected, deduplicated, and promoted.
-
-## 3.2 Recall queries
-
-The manager was also given the ability to generate explicit recall queries.
-
-For example:
-
-```text
-Current message:
-"What programming language do I prefer for OAs?"
-
-Recall:
-"What programming language does the user prefer for coding assessments?"
-```
-
-The memory layer then performs semantic retrieval against the graph/database.
-
-This separated two different reasoning tasks:
-
-1. **What information do I need?**
-2. **Where is that information stored?**
-
-The LLM handled the first; the memory backend handled the second.
-
----
-
-# 4. Local LLM — Ollama + Qwen3
-
-A major requirement appeared during development: **Skippey should not fundamentally rely on the internet.**
-
-The hosted NVIDIA API was therefore replaced for the local memory pipeline by Ollama.
-
-The architecture changed from:
-
-```text
-Skippey → NVIDIA API → Llama
-```
-
-to:
-
-```text
-Skippey → Ollama → Qwen3
-```
-
-The local model used in the current experiments is:
+The current local model is:
 
 ```text
 qwen3:4b-instruct
 ```
 
-## Why local inference?
+The architecture changed from:
 
-- offline-capable core operation;
-- no API request required for each memory operation;
-- no dependency on a third-party LLM service for the assistant's memory;
-- control over model/runtime selection;
-- eventual ability to move the whole system to a local GPU machine.
+```text
+NVIDIA API → hosted model
+```
 
-The trade-off is that model quality and latency are constrained by local hardware.
+to:
 
-The project therefore deliberately treats **memory as persistent external knowledge** rather than assuming the model itself needs to be retrained whenever Skippey learns something.
+```text
+Ollama → Qwen3 → local inference
+```
+
+This was driven by the desire for Skippey to operate without relying on the internet for its core assistant and memory functionality.
+
+The trade-off is that local inference is constrained by available hardware, but it removes dependence on a remote API for the model itself.
 
 ---
 
-# 5. Generation 2 — Neo4j + Graphiti
+# 8. Current memory-manager architecture
 
-The next major change was moving from PostgreSQL/pgvector to **Neo4j + Graphiti**.
+The current design intentionally returns to the useful part of the earlier separate memory-manager architecture, but with a much stronger backend and a local model.
 
-The reason was not simply that graph databases were interesting. The memory representation had started to require explicit entities and relationships.
+The memory manager receives the user's message and determines the memory operations required.
 
-Graphiti provided the infrastructure for:
-
-- episode ingestion;
-- entity extraction;
-- relationship extraction;
-- temporal facts;
-- embeddings;
-- semantic search;
-- reranking;
-- graph persistence in Neo4j.
-
-The architecture became:
+Conceptually:
 
 ```text
-Conversation
-      ↓
+                 User message
+                      │
+                      ▼
+              ┌───────────────┐
+              │   Qwen3       │
+              │ Memory Manager│
+              └───────┬───────┘
+                      │
+              memory operations
+                      │
+              ┌───────┴────────┐
+              ▼                ▼
+          Remember           Recall
+              │                │
+              ▼                ▼
+          Graphiti          Graphiti
+              │                │
+              └───────┬────────┘
+                      ▼
+                    Neo4j
+                      │
+                      ▼
+              Memory results
+                      │
+                      ▼
+               Main chatbot
+                      │
+                      ▼
+                   Response
+```
+
+The main chatbot can therefore focus on conversation while the memory manager focuses on memory policy.
+
+## 8.1 No separate update operation
+
+The earlier PostgreSQL system needed explicit operations such as `update()` or `modify()`.
+
+The graph-based design changes this model.
+
+Instead of requiring a dedicated update function for every change, a new episode/fact can be added and Graphiti's temporal graph machinery can represent the evolution of the information.
+
+This simplifies the memory interface while giving the graph more information about how facts change over time.
+
+The core memory actions are therefore becoming closer to:
+
+```text
+remember / add
+recall
+forget / invalidate when appropriate
+```
+
+rather than requiring a separate CRUD-style update path for every memory change.
+
+---
+
+# 9. Memory extraction and context separation
+
+The memory manager was refined so that **recent conversation context is not automatically treated as new memory**.
+
+Recent context exists primarily to make the current message understandable.
+
+The intended distinction is:
+
+```text
+Recent context
+    ↓
+helps resolve references
+
+Current message
+    ↓
+source of new memory
+
+Graph memory
+    ↓
+used only when information is needed
+```
+
+For example, context can establish what `it`, `that`, or `they` refers to without forcing the manager to store the entire context again.
+
+This was important because earlier tests showed that overly large context could cause the memory manager to over-store information that was merely present in the prompt.
+
+---
+
+# 10. Temporary memory — the next memory pipeline
+
+The current memory architecture is being redesigned around a **temporary-memory-first** model.
+
+Rather than immediately treating every extracted memory as permanent long-term knowledge, newly extracted memories will first receive a temporary-memory classification/tag.
+
+Conceptually:
+
+```text
+User message
+     ↓
 Memory manager
-      ↓
-Graphiti episode
-      ↓
-Entity / relationship extraction
-      ↓
-Neo4j graph
+     ↓
+Temporary memory
+     ↓
+        ... normal operation ...
+     ↓
+Sleep / maintenance period
+     ↓
+Memory maintenance
+     ├── discard / forget weak memories
+     ├── consolidate duplicates
+     ├── update temporal knowledge
+     └── promote useful memories
+              ↓
+        Long-term memory
 ```
 
-## 5.1 Why this was better than vector-only memory
+This is intended to behave more like human memory than a database where every stored sentence immediately becomes permanent.
 
-Instead of storing only:
+## 10.1 Sleep / maintenance period
 
-```text
-"Chris uses Python for OAs"
-```
+A planned maintenance process will run during a designated sleep period rather than forcing all memory consolidation to happen synchronously with every user message.
 
-the system could potentially represent:
+This allows the online conversation pipeline to stay focused on responsiveness while heavier memory processing happens asynchronously.
 
-```text
-Chris ──PREFERS_FOR──► Python
-                         │
-                         ▼
-                 coding assessments
-```
+The maintenance stage is intended to perform the actual:
 
-and connect the same entities to other facts.
+- forgetting;
+- consolidation;
+- short-term → long-term promotion;
+- cleanup;
+- temporal memory maintenance.
 
-This is especially useful for a personal assistant because the same entity can participate in many memories:
-
-```text
-Chris
- ├── works on → Skippey
- ├── uses → Python
- ├── uses → C++
- └── works on → robotics projects
-```
+This is a major direction for the memory system and is still under development.
 
 ---
 
-# 6. Local BGE embeddings
+# 11. BGE embeddings and reranking
 
-Graphiti was configured with a local Sentence Transformers embedding implementation rather than relying on a remote embedding API.
+Graphiti is currently using local Sentence Transformers models rather than a remote embedding API.
 
-The embedding model became:
+The embedding model is:
 
 ```text
 BAAI/bge-large-en-v1.5
 ```
 
-A custom `BGEEmbedder` implementing Graphiti's `EmbedderClient` interface was created.
-
-It provides:
+A custom `BGEEmbedder` implements Graphiti's `EmbedderClient` interface with:
 
 ```text
 create()
 create_batch()
 ```
 
-The implementation had to handle Graphiti's single-item calling convention as well as batch embedding.
-
-The important interface behavior was tested explicitly because Graphiti can call the embedder with either a string or a one-element list.
-
----
-
-# 7. BGE reranking
-
-Graphiti was also configured with:
+Graphiti is also configured with:
 
 ```text
 BAAI/bge-reranker-v2-m3
@@ -350,577 +458,338 @@ BAAI/bge-reranker-v2-m3
 
 through `BGERerankerClient`.
 
-The retrieval pipeline therefore became approximately:
+The retrieval path is therefore approximately:
 
 ```text
 Query
   ↓
-Embedding
+BGE embedding
   ↓
-Graph/vector candidate retrieval
+Graphiti / Neo4j retrieval
   ↓
 BGE reranking
   ↓
-Relevant facts
+Relevant memories
 ```
 
-This improved the sophistication of retrieval but introduced additional local inference cost.
-
-That latency trade-off is now one of the things we are measuring rather than assuming is worth the cost.
+This introduces local computation cost, so retrieval and reranking latency are being measured before optimization decisions are made.
 
 ---
 
-# 8. Graphiti initialization and retrieval behavior
+# 12. Graph/entity experiments
 
-The memory layer eventually settled around functions such as:
+A canonical user entity was manually created in Neo4j so that facts could ideally converge on one persistent user node.
 
-```text
-initialize()
-remember()
-recall()
-process_message()
-close()
-```
+Testing exposed a subtle Graphiti problem: creating the entity manually does not automatically guarantee that Graphiti will resolve future mentions to that exact node.
 
-## `initialize()`
+Episodes could contain the correct user name while Graphiti still failed to connect a generated relation to the existing entity.
 
-Builds Graphiti indices and constraints once per process.
-
-This was important because repeatedly rebuilding the graph indices for every operation would add unnecessary startup work.
-
-## `remember()`
-
-Creates a Graphiti episode from a memory/message and assigns it to a graph group.
-
-## `recall()`
-
-Runs a natural-language Graphiti search and extracts facts from the returned results.
-
-The implementation explicitly retrieves **multiple** results rather than assuming the search returns only one useful memory.
-
-## `process_message()`
-
-Provides the high-level pipeline:
-
-```text
-message
-  ↓
-recall relevant existing memory
-  ↓
-remember current message
-```
-
-The larger memory-manager architecture later wraps this lower-level API so that only selected memories are written.
-
----
-
-# 9. Temporary vs long-term memory
-
-The system then evolved from one memory store toward two conceptual layers:
-
-```text
-skippey_temp
-skippey_main
-```
-
-The intended lifecycle is:
-
-```text
-Conversation
-     ↓
-Extract useful facts
-     ↓
-Temporary memory
-     ↓
-Periodic maintenance
-     ↓
-Evaluate usefulness
-     ↓
-Promote durable facts
-     ↓
-Long-term memory
-```
-
-The important distinction is:
-
-> **Temporary memory is not simply a second database. It is a staging area for information that has not yet earned long-term persistence.**
-
-The planned maintenance behavior is to process temporary memories periodically, consolidate useful information, and promote durable knowledge into the long-term graph.
-
-This builds on the original PostgreSQL-era idea of importance, recency, and reinforcement without requiring a fixed TTL for every memory.
-
----
-
-# 10. Context is not memory
-
-One of the more important prompt-design problems appeared during multi-turn testing.
-
-Early versions supplied previous messages to the memory manager and sometimes caused the model to store facts merely because they appeared in recent context.
-
-That was not the intended behavior.
-
-The desired distinction became:
-
-```text
-Recent context
-    = helps understand the current message
-
-Current message
-    = source of new memories
-
-Long-term memory
-    = retrieved only when needed
-```
-
-For example, if recent context says:
-
-```text
-Chris uses Qwen3 locally.
-```
-
-and the current message asks:
-
-```text
-What model am I using?
-```
-
-the context can make the current message self-contained enough to understand what it refers to. It should not automatically create another memory just because that sentence was supplied as context.
-
-This significantly reduced unnecessary memory creation and made the manager less prone to overfitting its output to the test prompts.
-
----
-
-# 11. Memory manager output format
-
-The manager eventually used a structured output concept:
-
-```json
-{
-  "remember": [],
-  "recall": []
-}
-```
-
-The intended behavior is:
-
-### `remember`
-
-Create concise, self-contained memories from facts expressed by the current message.
-
-### `recall`
-
-Create search queries only when the current message requires information that is not already available.
-
-This produced an important optimization:
-
-```text
-No recall needed
-      ↓
-Do not search Graphiti
-```
-
-rather than performing a memory search for every message.
-
-Likewise:
-
-```text
-No new fact
-      ↓
-Do not write a memory
-```
-
-This became the basis for reducing unnecessary graph operations.
-
----
-
-# 12. Real multi-turn testing
-
-A test conversation was used to evaluate whether memory persisted across calls and whether the manager could retrieve facts introduced several turns earlier.
-
-Example progression:
-
-```text
-Turn 1:
-Chris is building Skippey and its memory system.
-
-Turn 2:
-Qwen3 is running locally through Ollama.
-
-Turn 3:
-Memories should be split into temporary and long-term storage.
-
-Turn 4:
-Neo4j is used for the memory system.
-
-Turn 5:
-What model is being used?
-
-Turn 6:
-Temporary memories should be processed once a day.
-```
-
-The important result was that the system could retrieve older graph facts on later turns, proving that persistence was coming from Neo4j rather than from the LLM's conversational context.
-
-The tests also exposed several problems with entity/relation extraction and duplicate retrieval, which became useful debugging cases rather than reasons to abandon the graph architecture.
-
----
-
-# 13. Entity resolution — the `Chris` problem
-
-A persistent `Chris` entity was manually created in Neo4j.
-
-The goal was to have facts such as:
-
-```text
-Chris prefers Python for coding assessments.
-Chris uses C++ for robotics projects.
-Chris is building Skippey.
-```
-
-all connect to the same user node.
-
-However, testing revealed an important Graphiti behavior:
-
-> **Having a node called `Chris` in Neo4j does not guarantee that Graphiti will resolve a newly extracted `Chris` mention to that exact node.**
-
-There were runs where Graphiti correctly extracted `Chris` in the episode text but failed to connect the relationship to the manually created entity.
-
-The system also produced warnings such as:
+Warnings encountered during experiments included patterns such as:
 
 ```text
 Source entity not found in nodes for edge relation: ...
 Target entity not found in nodes for edge relation: ...
 ```
 
-These experiments demonstrated that entity creation and entity resolution are separate problems.
-
-The current direction is to preserve the canonical user entity and make resolution explicit/reliable rather than recreating the node every time the program starts.
-
----
-
-# 14. Relation extraction problems
-
-Graphiti occasionally generated relations such as:
+This demonstrated that:
 
 ```text
-PREFERS_FOR
-IS_USED_FOR
-USES_FOR
-HAS_PROCESSING_SCHEDULE
+Entity exists in Neo4j
+        ≠
+Graphiti will always resolve a new mention to it
 ```
 
-while failing to find one of the source/target entities required for the relation.
-
-This did not necessarily mean the memory text was lost; the episode and extracted facts could still exist even when a particular graph edge failed.
-
-The lesson was that **graph construction is probabilistic at the extraction layer**, even though Neo4j itself is deterministic once a node/relationship write has been specified.
-
-This is one reason the project keeps the natural-language fact itself valuable instead of depending exclusively on a perfect graph edge.
+Entity resolution remains an active part of the design rather than something assumed to be solved merely by creating a node once.
 
 ---
 
-# 15. Duplicate and noisy recall
+# 13. Retrieval problems discovered during testing
 
-During testing, some recall queries returned repeated or weakly related facts.
+Multi-turn tests revealed several useful failure modes:
 
-For example, a query about the assistant's model could return the same Qwen/Neo4j facts multiple times, sometimes because multiple episodes encoded essentially the same information.
+- retrieval could return repeated facts;
+- multiple episodes could encode effectively the same information;
+- semantically related memories were sometimes returned instead of the most useful one;
+- a recall query could retrieve information that was relevant to the broader project but irrelevant to the exact question;
+- entity/relation extraction could fail even when the natural-language memory itself was retained.
 
-This exposed several independent issues:
-
-- multiple episodes can represent the same fact;
-- semantic search may return several near-duplicates;
-- reranking does not automatically mean deduplication;
-- a memory search can return relevant-but-not-best facts;
-- the caller needs to decide how many results are actually useful.
-
-The project therefore began treating **retrieval quality and memory consolidation as separate optimization problems**.
-
----
-
-# 16. Why Graphiti rather than manually constructing every relationship
-
-At one point it was considered whether memories should be converted into graph entities and relationships entirely by application code.
-
-The decision was to let Graphiti handle entity and relationship extraction while the application controls the higher-level memory policy.
-
-In other words:
+These tests led to the principle that **memory quality has several independent dimensions**:
 
 ```text
-Application
-    ↓
-Decides WHAT should be remembered/recalled
-
-Graphiti
-    ↓
-Decides HOW the fact becomes graph entities/relations
-
-Neo4j
-    ↓
-Persists the resulting graph
+Extraction quality
+      +
+Entity resolution
+      +
+Retrieval quality
+      +
+Deduplication
+      +
+Consolidation
+      +
+Temporal validity
 ```
 
-This keeps the memory policy separate from graph-construction mechanics.
+A knowledge graph does not automatically solve all of them.
 
 ---
 
-# 17. Performance became an explicit engineering problem
+# 14. Performance optimization
 
-After the functionality became reasonably stable, the next problem was latency.
+Once the pipeline became functional, latency became the next engineering problem.
 
-The memory pipeline can involve several expensive operations:
+The system can involve several expensive stages:
 
 ```text
-Qwen memory manager
+Qwen3 memory manager
        ↓
 BGE embedding
        ↓
 Graphiti processing
        ↓
-Neo4j search
+Neo4j retrieval
        ↓
 BGE reranking
+       ↓
+Main model response
 ```
 
-Instead of optimizing blindly, timing instrumentation was added to measure the actual cost of each stage.
+The current approach is to measure first and optimize second.
 
-The timers are intentionally kept outside the core memory functions during normal use. Benchmark code measures calls such as:
+Timers are kept outside the core memory functions during benchmarking so that the production functions themselves do not continually print timing information.
 
-```text
-recall()
-remember()
-process_message()
-```
-
-without making the production memory API print timing information.
-
-The optimization process will therefore be measurement-driven:
+The benchmark loop is:
 
 ```text
 Measure
   ↓
-Identify bottleneck
+Find bottleneck
   ↓
-Optimize bottleneck
+Change one thing
   ↓
 Measure again
+  ↓
+Keep/revert based on result
 ```
 
-Performance numbers will be added here only after actual benchmarks have been run.
+Actual latency numbers will be recorded in the performance documentation once representative measurements are collected.
 
 ---
 
-# 18. Docker migration
+# 15. Docker — fully self-contained deployment
 
-Once the architecture had become dependent on several local services and ML models, reproducibility became a concern.
+The current Skippey environment is being moved into a self-contained Docker Compose stack.
 
-The target environment was moved toward Docker Compose:
+The target architecture is:
 
 ```text
 Docker Compose
 │
 ├── Skippey
-│   ├── Python
+│   ├── Python runtime
+│   ├── memory system
 │   ├── Graphiti
 │   ├── Sentence Transformers
-│   ├── BGE
-│   └── memory.py
+│   └── BGE models/cache
 │
 ├── Neo4j
 │   └── persistent Docker volume
 │
 └── Ollama
-    └── Qwen3
+    └── Qwen3 model
 ```
 
-## 18.1 Why Docker
+The purpose is not merely convenience. The goal is for the assistant's complete runtime to be reproducible and portable without depending on a host Python environment or separately installed database/model services.
 
-Docker provides:
+Persistent Docker volumes are used so that:
 
-- dependency isolation;
-- reproducible Python environments;
-- isolated Neo4j and Ollama services;
-- persistent volumes for databases and model caches;
-- easier migration to another machine.
+- Neo4j data survives container recreation;
+- downloaded Hugging Face models are cached;
+- Ollama models survive container recreation.
 
-A host Python virtual environment is therefore not required for the containerized runtime.
-
-## 18.2 Migration problems
-
-The migration exposed normal dependency/infrastructure issues:
-
-- large PyTorch/CUDA packages made the first image build unnecessarily heavy;
-- the dependency list initially missed packages used by the larger Skippey application, such as `fastcoref`;
-- an existing Neo4j container conflicted with the Compose container name;
-- Neo4j data had to be preserved while replacing the container;
-- the Ollama image itself was several gigabytes and experienced network timeouts while downloading;
-- host Ollama had to be stopped before Docker could bind port `11434`.
-
-These were deployment issues rather than memory-architecture failures.
-
-The important data-preservation decision was to reuse the existing Neo4j Docker volume while replacing the container, rather than deleting the database.
+The current project therefore aims to be **fully self-contained at the infrastructure level**.
 
 ---
 
-# 19. Current development workflow
+# 16. Why the architecture has changed so many times
 
-During development, the memory system can be run directly in the Skippey container without requiring the full assistant application to start.
-
-The current development command is conceptually:
-
-```bash
-docker compose run --rm skippey python memory.py
-```
-
-This is useful because the main `skippey.py` application and other components can remain unfinished while the memory subsystem is developed independently.
-
-The planned development workflow is:
+The project did not replace technologies arbitrarily. Each major change came from a limitation in the previous architecture:
 
 ```text
-Edit memory.py
-      ↓
-Syntax check
-      ↓
-Run memory.py in Docker
-      ↓
-Measure if necessary
-      ↓
-Inspect Neo4j / recall behavior
-      ↓
-Document meaningful architectural changes
-```
-
-When a new Python dependency is introduced, the Docker image needs to be rebuilt. Ordinary source-code changes do not conceptually require rebuilding once source bind-mounting is used for development.
-
----
-
-# 20. Current architecture
-
-The current design can be summarized as:
-
-```text
-                         ┌──────────────────────┐
-                         │      Skippey         │
-                         │                      │
-User ──────────────────► │  Memory Manager      │
-                         │       Qwen3          │
-                         │          │           │
-                         │    ┌─────┴─────┐     │
-                         │    ▼           ▼     │
-                         │ remember     recall  │
-                         │    │           │     │
-                         └────┼───────────┼─────┘
-                              │           │
-                              ▼           ▼
-                         ┌───────────────────┐
-                         │      Graphiti     │
-                         │  BGE + reranking  │
-                         └─────────┬─────────┘
-                                   │
-                                   ▼
-                         ┌───────────────────┐
-                         │       Neo4j        │
-                         │                   │
-                         │ TEMP + LONG TERM │
-                         └───────────────────┘
-
-                  Qwen3 inference runs through Ollama
-```
-
-The historical progression is:
-
-```text
-NVIDIA API
-    ↓
+Simple chatbot
+    │
+    │ no persistent memory
+    ▼
 PostgreSQL + pgvector
-    ↓
-remember / recall / forget / modify
-    ↓
-memory decay + reinforcement concepts
-    ↓
-local Ollama + Qwen3
-    ↓
+    │
+    │ LLM tool-use was inconsistent
+    │ small models lacked reasoning
+    │ large models were slow/expensive
+    ▼
+Separate memory-management pipeline
+    │
+    │ memory representation still too flat
+    │ graph relationships became important
+    ▼
 Neo4j + Graphiti
-    ↓
-BGE-large embeddings + BGE reranking
-    ↓
-message → remember[] / recall[]
-    ↓
-temporary + long-term memory
-    ↓
-entity-resolution experiments
-    ↓
-benchmarking and latency optimization
-    ↓
-Dockerized deployment
+    │
+    │ hosted inference still undesirable
+    ▼
+Ollama + Qwen3
+    │
+    │ permanent storage for everything is not human-like
+    ▼
+Temporary memory + sleep/maintenance
+    │
+    └──► future consolidation + long-term memory
+```
+
+The architecture is therefore the result of repeatedly identifying the limiting part of the previous design and moving that responsibility to a more suitable component.
+
+---
+
+# 17. Current high-level architecture
+
+```text
+                         ┌───────────────────────┐
+                         │        Skippey        │
+                         │      Chatbot/AI       │
+                         └───────────┬───────────┘
+                                     │
+                              User message
+                                     │
+                                     ▼
+                         ┌───────────────────────┐
+                         │  Memory Manager       │
+                         │       Qwen3           │
+                         │      via Ollama       │
+                         └───────────┬───────────┘
+                                     │
+                          Decide memory operations
+                                     │
+                         ┌───────────┴───────────┐
+                         ▼                       ▼
+                    Remember                  Recall
+                         │                       │
+                         └───────────┬───────────┘
+                                     ▼
+                              Graphiti + BGE
+                                     │
+                                     ▼
+                                  Neo4j
+                                     │
+                          temporary memory now
+                                     │
+                            sleep / maintenance
+                                     │
+                         ┌───────────┴───────────┐
+                         ▼                       ▼
+                      Forget                Promote
+                                                 │
+                                                 ▼
+                                          Long-term memory
+                                     │
+                                     ▼
+                              Main chatbot model
+                                     │
+                                     ▼
+                                  Response
 ```
 
 ---
 
-# 21. Remaining work
+# 18. Long-term vision
 
-The current system is intentionally not considered finished.
+The memory system is only one part of the larger assistant architecture.
+
+The intended direction is to make Skippey progressively more capable and more human-like in how it interacts with information.
+
+Planned capabilities include:
+
+- computer vision;
+- web searching;
+- additional external/internal tools;
+- richer memory consolidation;
+- temporal reasoning;
+- better entity resolution;
+- autonomous maintenance during sleep periods;
+- improved local models as hardware allows.
+
+The long-term goal is not simply to build a chatbot with a database attached to it.
+
+The goal is a persistent personal assistant whose **model, memory, tools, perception, and maintenance processes work together**.
+
+---
+
+# 19. Engineering principles
+
+Several principles have emerged from the project:
+
+### Memory should be explicit
+
+Not every conversation message should become permanent memory.
+
+### Context is not memory
+
+Recent context exists primarily to make the current message understandable.
+
+### Memory management should be separated from conversation generation
+
+The model generating the final answer should not necessarily be responsible for every memory decision.
+
+### Memory should evolve independently of model weights
+
+The assistant should learn new facts by updating its persistent memory rather than requiring continuous model retraining.
+
+### Graph structure is useful but not automatically correct
+
+Neo4j stores the graph deterministically, but entity and relationship extraction can still be imperfect.
+
+### Temporary memory should absorb uncertainty
+
+New information can be stored first and evaluated later rather than forcing every decision to happen synchronously.
+
+### Optimize from measurements
+
+Latency changes should be justified with benchmarks rather than intuition.
+
+### Failed approaches are part of the engineering story
+
+The NVIDIA → PostgreSQL → separate memory manager → Graphiti/Neo4j → local Qwen → temporary/long-term progression is the result of iterative problem solving, not unnecessary rewrites.
+
+---
+
+# 20. Remaining work
 
 ## Memory
 
-- finish temporary-to-long-term promotion;
+- complete the temporary-memory maintenance process;
+- implement robust forgetting;
+- implement short-term → long-term promotion;
 - consolidate duplicate memories;
-- improve entity resolution for the canonical user entity;
-- decide how much graph structure should be trusted versus natural-language facts;
-- improve recall ranking and result diversity;
-- determine whether reranking is worth its latency for every query.
+- improve temporal validity handling;
+- improve canonical entity resolution;
+- improve retrieval quality and diversity.
 
 ## Performance
 
-- benchmark Qwen manager latency;
-- benchmark BGE embedding latency;
-- benchmark Graphiti ingestion;
-- benchmark Neo4j search;
-- benchmark reranking;
+- benchmark every major memory stage;
 - reduce unnecessary LLM calls;
-- evaluate whether a smaller/faster embedding or reranker is sufficient;
-- measure end-to-end latency before and after every meaningful optimization.
+- evaluate embedding/reranking cost;
+- optimize Graphiti/Neo4j retrieval;
+- measure end-to-end response latency;
+- record before/after results for meaningful optimizations.
 
-## Integration
+## Assistant
 
-- integrate the memory subsystem into the main Skippey assistant;
-- ensure conversation context and memory remain separate;
-- add the missing dependencies required by the complete application;
-- eventually remove the host Python environment once Docker is fully validated.
+- integrate the refined memory pipeline into the main chatbot;
+- add computer vision;
+- add web search;
+- add additional tools;
+- improve autonomous maintenance;
+- eventually evaluate larger local models.
 
-## Hardware
+## Infrastructure
 
-The long-term plan is to run the complete local stack on a machine with a stronger GPU. A future RTX-class laptop should make it practical to evaluate larger local models while retaining the same Ollama-based architecture.
-
----
-
-# 22. Engineering principles that emerged
-
-Several principles survived the changes in architecture:
-
-### 1. Memory should be explicit
-
-Not every sentence in a conversation deserves permanent storage.
-
-### 2. Context is not memory
-
-Recent conversation context exists to interpret the current message; it should not automatically become persistent knowledge.
-
-### 3. The model and memory are separate
-
-Skippey should be able to learn new facts without retraining the LLM.
-
-### 4. Retrieval and reasoning are different jobs
-
-The LLM can determine what information is needed; the memory backend should retrieve it.
-
-### 5. Graph structure is useful, but extraction is probabilistic
-
-Neo4j provides deterministic persistence, while the natural-language entity/relation extraction performed before the write can fail or produce imperfect relations.
-
-### 6. Optimize from measurements
-
-Latency should be measured before changing architecture or replacing components.
-
-### 7. Failed approaches are useful engineering information
-
-The history of Skippey includes approaches that were replaced because they did not satisfy the emerging requirements. Those failures are part of the design rationale, not something to hide.
+- finish validating the complete Docker stack;
+- keep persistent model/database volumes;
+- make the full runtime reproducible on another machine.
