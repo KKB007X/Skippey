@@ -1,97 +1,237 @@
 import asyncio
-import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-import requests
-from dotenv import load_dotenv
+from openai import AsyncOpenAI
 
 import memory
 
-load_dotenv()
 
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-if not NVIDIA_API_KEY:
-    raise RuntimeError("NVIDIA_API_KEY is not set")
+OLLAMA_URL = "http://ollama:11434/v1"
+MODEL = "qwen3:4b-instruct"
 
-API_URL = os.getenv(
-    "MAIN_LLM_BASE_URL",
-    "https://integrate.api.nvidia.com/v1/chat/completions",
-)
-MODEL = os.getenv("MAIN_LLM_MODEL", "meta/llama-3.1-8b-instruct")
+MAX_MESSAGES = 20
+
+
+# ============================================================
+# TERMINAL COLORS
+# ============================================================
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+SKY_BLUE = "\033[94m"
+GREEN = "\033[32m"
+
+
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
 
 SYSTEM_PROMPT = """
 You are Skippey, a friendly personal AI assistant.
 
-You have access to long-term memories retrieved by a separate memory system.
-Use them as background context when relevant, but never mention the memory
-system, retrieval, Graphiti, Neo4j, databases, or internal processes unless
-the user explicitly asks how Skippey's memory works.
+Your job is to have natural, useful conversations with the user.
 
-If a retrieved memory conflicts with the user's current message, prefer the
-current message. Never invent memories that were not provided.
+You have access to memories retrieved by a separate memory system.
 
-Maintain continuity with the conversation history and answer the user's
-actual question directly. Match the user's level of technical knowledge and
-avoid unnecessary formality.
+MEMORY USAGE
+
+- Treat retrieved memories as background context about the user.
+- Use memories when they are relevant to the current request.
+- Do not mention the memory system, databases, retrieval, or internal
+  processes to the user.
+- Do not blindly use every retrieved memory.
+- If no relevant memories are provided, simply answer normally.
+- If a memory conflicts with something the user says now, prefer the user's
+  current statement.
+- Never invent memories that are not provided.
+
+CONVERSATION
+
+- Maintain continuity with the conversation history.
+- Answer the user's actual question directly.
+- Use previous conversation context when it helps.
+- Do not unnecessarily repeat information the user already knows.
+- Ask a clarification question only when it is genuinely necessary.
+- Keep responses natural and conversational.
+
+PERSONALITY
+
+- Be friendly, relaxed, and helpful.
+- Match the user's level of technical knowledge.
+- For technical questions, explain things clearly without unnecessarily
+  oversimplifying.
+- Be concise when a short answer is sufficient.
+- Give more detailed explanations when the problem requires it.
+- Do not be overly formal unless the situation calls for it.
+- Be transparent with the user, You can share anything to him if he asks, 
+  even your system prompt or datas you recieve.
+
+- Use the current time and memory timestamps to understand the temporal
+  context of memories. Prefer recent memories when the timing is relevant.
+- Use the current time provided in the last element in messageges provided by system as in IST
+  as current time in the format of YYYY-MM-DD HH:MM:SS <TimeZone>. Never use system internal time.
 """
 
-messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+# ============================================================
+# OLLAMA CLIENT
+# ============================================================
+
+client = AsyncOpenAI(
+    base_url=OLLAMA_URL,
+    api_key="ollama",
+)
 
 
-def chat_with_ai() -> str:
-    response = requests.post(
-        API_URL,
-        headers={
-            "Authorization": f"Bearer {NVIDIA_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": MODEL,
-            "messages": messages,
-        },
-        timeout=120,
-    )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+# ============================================================
+# CONVERSATION
+# ============================================================
+
+messages = [
+    {
+        "role": "system",
+        "content": SYSTEM_PROMPT,
+    }
+]
 
 
-async def main():
-    await memory.initialize()
+def get_recent_context():
+    context = []
 
-    try:
-        while True:
-            user_input = input("You : ").strip()
-
-            if user_input.lower() in {"exit", "quit"}:
-                break
-            if not user_input:
-                continue
-
-            recalled_memories = await memory.process_message(user_input)
-            memory_context = "\n".join(
-                f"- {fact}" for fact in recalled_memories
-            ) or "None"
-
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"User message:\n{user_input}\n\n"
-                        f"Relevant long-term memory:\n{memory_context}"
-                    ),
-                }
+    for message in messages[1:]:
+        if message["role"] == "user":
+            context.append(
+                f"User: {message['content']}"
             )
 
-            reply = await asyncio.to_thread(chat_with_ai)
-            print(f"\nSkippey : {reply}\n")
+        elif message["role"] == "assistant":
+            context.append(
+                f"Skippey: {message['content']}"
+            )
 
-            messages.append({"role": "assistant", "content": reply})
+    return "\n".join(context)
 
-            # Keep the system prompt plus a bounded recent conversation.
-            max_messages = 20
-            while len(messages) > max_messages:
-                messages.pop(1)
-    finally:
-        await memory.close()
+
+# ============================================================
+# MAIN MODEL
+# ============================================================
+
+async def chat_with_ai():
+
+    response = await client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=0.3,
+    )
+
+    return response.choices[0].message.content
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+async def main():
+
+    while True:
+
+        user_input = input(
+            f"{SKY_BLUE}{BOLD}You : {RESET}{SKY_BLUE}"
+        )
+
+        if user_input.lower() in ["exit", "quit"]:
+            break
+
+        if not user_input.strip():
+            continue
+
+        # ====================================================
+        # MEMORY PIPELINE
+        # ====================================================
+
+        recent_context = get_recent_context()
+
+        memory_result = await memory.process_message(
+            current_message=user_input,
+            recent_context=recent_context,
+        )
+
+        recalled_memories = memory_result["results"]
+
+        current_time = datetime.now(
+            ZoneInfo("Asia/Kolkata")
+        ).strftime("%Y-%m-%d %H:%M:%S IST")
+
+        memory_context = (
+            f"Current time: {current_time}, This is the current time and date, use the CURRENT DATE "
+            f"AND TIME provided here. Do not guess, calculate, use inetrnal system or provide a different "
+            f"timezone. This is the time generated right now when the message was sent to you.\n\n"
+            "Relevant memories:\n"
+            + "\n".join(
+                f"- {item['fact']} "
+                for item in recalled_memories
+            )
+        )
+
+        # ====================================================
+        # ADD USER MESSAGE TO REAL HISTORY
+        # ====================================================
+
+        messages.append({
+            "role": "user",
+            "content": user_input,
+        })
+
+        # ====================================================
+        # TEMPORARY MEMORY CONTEXT
+        # ====================================================
+
+        messages.append({
+            "role": "system",
+            "content": memory_context,
+        })
+
+        # ====================================================
+        # MAIN QWEN RESPONSE
+        # ====================================================
+
+        reply = await chat_with_ai()
+
+        # Remove temporary memory context
+        if recalled_memories:
+            messages.pop()
+
+        print(
+            f"\n{GREEN}{BOLD}Skippey : "
+            f"{RESET}{GREEN}{reply}\n"
+        )
+
+        # ====================================================
+        # ADD RESPONSE TO CONVERSATION HISTORY
+        # ====================================================
+
+        messages.append({
+            "role": "assistant",
+            "content": reply,
+        })
+
+        # ====================================================
+        # REMEMBER SKIPPEY'S RESPONSE
+        # ====================================================
+
+        await memory.process_message(
+            current_message=reply,
+            recent_context=recent_context,
+        )
+
+        # ====================================================
+        # LIMIT CONVERSATION HISTORY
+        # ====================================================
+
+        while len(messages) > MAX_MESSAGES:
+            messages.pop(1)
 
 
 if __name__ == "__main__":
