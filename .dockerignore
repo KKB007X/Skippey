@@ -1,0 +1,9 @@
+.venv
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+Nvidia_API.txt

@@ -1,0 +1,81 @@
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: skippey-neo4j
+
+    environment:
+      NEO4J_AUTH: ${NEO4J_AUTH}
+      NEO4J_PLUGINS: '["apoc"]'
+
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+
+    restart: unless-stopped
+
+  skippey:
+    build: .
+    container_name: skippey
+
+    depends_on:
+      - neo4j
+      - ollama
+
+    environment:
+      NEO4J_URI: ${NEO4J_URI}
+      NEO4J_USER: ${NEO4J_USER}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: skippey-ollama
+
+    ports:
+      - "11434:11434"
+
+    volumes:
+      - ollama_data:/root/.ollama
+
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: skippey-postgres
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    restart: unless-stopped
+volumes:
+  neo4j_data:
+    external: true
+    name: 6534d73da51b97534a2a0e159c0e5d28092e122c4aa42e616bc9489075749020
+
+  neo4j_logs:
+    external: true
+    name: 345d03026cdeed4aedb20c2f0d59f40c10f58d5cbc3bee4d15329bc872293c4a
+
+  huggingface_cache:
+
+  ollama_data:
+
+  postgres_data:
